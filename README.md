@@ -1,108 +1,68 @@
-# futbol-predict — Fases 0 y 1 (datos + modelo de goles)
+# futbol-predict — calendario multi-liga + modelo que aprende
 
-Herramienta de análisis predictivo de fútbol. Cubre la **capa de datos**
-(ingesta y almacenamiento) y la primera **capa analítica**: un modelo
-Dixon-Coles de goles que produce probabilidades de 1X2, over/under y BTTS,
-validado con un backtest honesto. Todo con tier gratuito.
+Herramienta de análisis predictivo de fútbol. Eliges un día y las ligas que
+quieras (Premier, LaLiga, Serie A, Bundesliga, Ligue 1, Champions, Mundial...)
+y ves los partidos de ese día con sus probabilidades (1X2, over/under, BTTS).
+El modelo se reentrena con los resultados hasta la fecha —dando más peso a los
+recientes—, así que **aprende conforme pasan las jornadas**.
 
-## Qué hace
-Fase 0 — datos:
-- Ingesta de **StatsBomb open data** (eventos con xG; gratis, sin clave).
-- Ingesta de **football-data.org** (calendario del Mundial; gratis con clave).
-- Almacenamiento en **Parquet + DuckDB**, consultable por SQL.
-
-Fase 1 — modelo de goles:
-- **Dixon-Coles** (Poisson bivariado con corrección de marcadores bajos y
-  decaimiento temporal) ajustado sobre una liga completa.
-- De la distribución de marcadores se derivan 1X2, over/under (1.5/2.5/3.5) y
-  BTTS — el enfoque riguroso: modelar la distribución, no un clasificador por
-  umbral.
-- **Backtest walk-forward** sin fuga de información, evaluado con log loss y
-  Brier (no solo accuracy) y comparado contra un baseline ingenuo.
-
-## Arranque rápido
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-Se abrirá la app en el navegador. La **primera vez**, pulsa el botón
-**Actualizar datos** (barra lateral): descarga los datos, entrena el modelo y
-guarda todo. A partir de ahí ese botón es lo único que necesitas tocar —cero
-terminal—. Usa la clave que **ya está en `.env`** (no hay que editar nada).
-
-La app tiene cuatro pestañas: Calendario (partidos del Mundial), Predicción de
-partido (elige dos equipos y ve 1X2, over/under, BTTS, xG y la matriz de
-marcadores), Histórico vs predicción (backtest y calibración) y Ratings.
-
-Si prefieres solo la tubería de datos sin abrir la app: `python run.py`.
+## Cómo funciona
+- Datos de la temporada en curso desde **football-data.org** (tier gratuito):
+  fixtures y resultados de las 12 competiciones del plan gratuito.
+- Un modelo **Dixon-Coles por competición** (Poisson bivariado con corrección
+  de marcadores bajos y decaimiento temporal) ajustado sobre los partidos ya
+  jugados; predice los próximos. La distribución de marcadores da 1X2,
+  over/under y BTTS de forma coherente.
+- **Validación**: backtest walk-forward sin fuga de información sobre una liga
+  histórica (Premier 2015/16), evaluado con log loss y Brier. Demuestra que el
+  motor está calibrado y bate a un baseline ingenuo.
+- **Auto-aprendizaje sin PC encendido**: un robot de GitHub Actions ejecuta la
+  tubería cada día, reentrena y guarda las predicciones; la web solo las lee.
 
 ## Estructura
 ```
 futbol-predict/
-├── app.py                # interfaz Streamlit: streamlit run app.py
-├── run.py                # tubería de datos + modelo (lo usa el botón Actualizar)
+├── app.py                      # interfaz Streamlit (calendario, predicción, validación)
+├── run.py                      # tubería: ingesta multi-liga + modelo + validación
 ├── requirements.txt
-├── .env                  # tu clave (ya configurada; ignorado por git)
-├── .env.example
+├── .env.example                # plantilla de la clave (la real nunca se sube)
 ├── .gitignore
-├── .streamlit/
-│   └── config.toml       # tema de la app
+├── .github/workflows/refresh.yml  # robot de auto-refresco diario
+├── .streamlit/config.toml
+├── data/tables/                # datos en Parquet (los actualiza el robot)
 └── src/
-    ├── config.py             # rutas y credenciales
-    ├── storage.py            # Parquet + DuckDB (save_table, query, connect)
-    ├── ingest_statsbomb.py   # eventos/xG de StatsBomb open data
-    ├── ingest_footballdata.py# calendario/resultados de football-data.org
-    ├── model_dixon_coles.py  # modelo de goles (fit, predict, ratings)
-    └── backtest.py           # backtest walk-forward + métricas
-```
-Los datos se guardan solos en `data/` (se crea al primer uso; no se sube a git).
-
-## Tablas que deja en DuckDB
-- `predicciones` — backtest: una fila por partido con probabilidades 1X2,
-  over 2.5, xG estimado y el resultado real (datos para "histórico vs
-  predicción" en la futura capa de visualización).
-- `ratings` — fuerza de ataque y defensa por equipo (interpretable).
-- `sb_matches_*`, `sb_shots`, `sb_competitions` — datos crudos de StatsBomb.
-- `fd_matches_WC`, `fd_standings_WC` — calendario del Mundial (al conectar).
-
-## Consultar los datos
-```python
-import sys; sys.path.insert(0, "src")
-import storage
-
-storage.list_tables()
-storage.query("SELECT COUNT(*) FROM sb_shots WHERE shot_statsbomb_xg > 0.3")
+    ├── config.py               # rutas, clave, lista de competiciones
+    ├── storage.py              # Parquet + DuckDB (en memoria)
+    ├── ingest_footballdata.py  # ingesta multi-liga normalizada
+    ├── ingest_statsbomb.py     # datos históricos (validación / xG)
+    ├── model_dixon_coles.py    # modelo de goles
+    ├── predict_competitions.py # ajuste por competición + predicción
+    └── backtest.py             # backtest walk-forward
 ```
 
-## Siguiente paso (Fase 2 y visualización)
-- Modelos de conteo (Poisson/binomial negativa) para córners, tarjetas y
-  disparos, reusando la misma mecánica de "modelar la distribución".
-- Tu propio modelo de **xG** sobre los eventos de disparo de StatsBomb
-  (`sb_shots`, columna `shot_statsbomb_xg` como etiqueta).
-- Capa **Streamlit**: calendario filtrable, dashboards de probabilidad por
-  variable y la vista "histórico vs predicción" leyendo la tabla `predicciones`.
-  Un botón "Actualizar datos" disparará `run.py` por detrás (cero terminal).
+## Poner en marcha el auto-refresco (un único paso)
+La clave de football-data.org se guarda **solo** como secreto del robot, nunca
+en el repo ni en la app:
+1. Saca tu clave gratuita en https://www.football-data.org/client/register
+2. En tu repo de GitHub: Settings → Secrets and variables → Actions →
+   "New repository secret". Nombre: `FOOTBALL_DATA_TOKEN`. Valor: tu clave.
+3. Ve a la pestaña Actions del repo, elige "Refrescar datos y modelo" y pulsa
+   "Run workflow" para la primera vez. A partir de ahí corre solo cada día.
 
-## Desplegar en la nube (gratis, sin tener el PC encendido)
-La app está lista para Streamlit Community Cloud. Resumen:
-1. Sube esta carpeta a un repositorio de GitHub (público). **No subas `.env`**
-   (ya está en `.gitignore`); el repo no necesita la clave para funcionar.
-2. Entra en https://share.streamlit.io, conecta tu cuenta de GitHub y pulsa
-   "Create app".
-3. Elige el repositorio, rama `main` y, en "Main file path", pon `app.py`.
-   Deploy. En unos minutos tendrás una URL pública `*.streamlit.app`.
+Cuando el robot termina, guarda los datos nuevos en el repo y la app desplegada
+(Streamlit Community Cloud) se actualiza sola.
 
-Los datos históricos ya vienen incluidos en `data/tables/`, así que la web
-carga al instante sin descargar nada. (El botón "Actualizar datos" sigue
-disponible para refrescar dentro de una sesión.)
+## Probar en local (opcional)
+```bash
+pip install -r requirements.txt
+# para datos en vivo, crea .env con FOOTBALL_DATA_TOKEN=tu_clave
+streamlit run app.py
+```
 
-## Notas de seguridad
-- El fichero `.env` con la clave **nunca** debe subirse a GitHub. Está en
-  `.gitignore`, pero si subes por la web arrastrando ficheros, asegúrate de no
-  incluirlo. Para datos en vivo en la nube se usarían los "Secrets" de
-  Streamlit, no un fichero en el repo.
-- El Mundial tiene poca muestra para ajustar fuerzas de equipo, por eso el
-  modelo se valida sobre una liga completa. Para el Mundial 2026 se usará
-  pooling bayesiano (Fase 3); las probabilidades irán con su incertidumbre.
-- StatsBomb open data es histórico, no en vivo: ideal para desarrollo.
+## Notas
+- Tier gratuito de football-data.org: 10 peticiones/minuto, scores con ligero
+  retardo (suficiente para un modelo que aprende por jornadas).
+- El Mundial tiene poca muestra: hasta que no se juegan suficientes partidos no
+  se predice (umbral configurable). El refinamiento bayesiano queda para más
+  adelante; las probabilidades irán con su incertidumbre.
 - Cita la fuente como StatsBomb si publicas análisis basados en sus datos.
