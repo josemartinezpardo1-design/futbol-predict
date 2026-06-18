@@ -1,0 +1,11 @@
+# Nunca subir secretos
+   .env
+
+   # Basura de Python
+   __pycache__/
+   *.pyc
+   .venv/
+
+   # Datos crudos / temporales
+   data/raw/
+   data/futbol.duckdb
