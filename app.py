@@ -1,12 +1,14 @@
-"""Capa de visualización (Streamlit).
+"""Capa de visualización (Streamlit) — calendario multi-liga + predicción.
 
-Lee las tablas que deja `run.py` en DuckDB y las presenta en cuatro vistas:
-calendario del Mundial, predicción de partido, histórico vs predicción y
-ratings de equipo. Incluye un botón "Actualizar datos" que ejecuta run.py por
-detrás, para no tener que tocar la terminal una vez montado.
+Lee las tablas que deja el robot de GitHub Actions (o run.py en local):
+  - fixtures: partidos de la temporada en curso de varias competiciones.
+  - predicciones_upcoming: probabilidades de los próximos partidos.
+  - ratings_by_comp / coverage / predicciones (validación histórica).
 
-Arranque:  streamlit run app.py
+Vista principal: eliges un día y las ligas que quieras, y ves los partidos de
+ese día con sus probabilidades del modelo.
 """
+import datetime as dt
 import subprocess
 import sys
 from pathlib import Path
@@ -22,213 +24,163 @@ sys.path.insert(0, str(ROOT / "src"))
 import storage
 import model_dixon_coles as dc
 
-ACCENT = "#1d9e75"  # verde campo, único acento del tema
-
+ACCENT = "#1d9e75"
 st.set_page_config(page_title="futbol-predict", page_icon="⚽", layout="wide")
 
 
-# ---------------------------------------------------------------- helpers puros
-def pick_league_table(tables: list[str]) -> str | None:
-    """Elige la tabla de partidos de liga más grande (la usada para el modelo)."""
-    candidates = [t for t in tables if t.startswith("sb_matches_")]
-    if not candidates:
-        return None
-    sizes = {t: len(storage.query(f'SELECT 1 FROM "{t}"')) for t in candidates}
-    return max(sizes, key=sizes.get)
-
-
-def compute_metrics(preds: pd.DataFrame) -> dict:
-    """Métricas de calibración sobre la tabla de predicciones del backtest."""
-    classes = ["H", "D", "A"]
-    cidx = {c: i for i, c in enumerate(classes)}
-    probs = preds[["p_home", "p_draw", "p_away"]].to_numpy()
-    y = preds["actual_outcome"].map(cidx).to_numpy()
-    onehot = np.zeros_like(probs)
-    onehot[np.arange(len(y)), y] = 1.0
-    pick = np.clip(probs[np.arange(len(y)), y], 1e-12, 1.0)
-    return {
-        "Partidos evaluados": int(len(preds)),
-        "Log loss (1X2)": round(float(-np.mean(np.log(pick))), 3),
-        "Brier (1X2)": round(float(np.mean(np.sum((probs - onehot) ** 2, axis=1))), 3),
-        "Acierto (1X2)": f"{(probs.argmax(1) == y).mean():.1%}",
-    }
-
-
-def reliability_table(preds: pd.DataFrame, bins: int = 8) -> pd.DataFrame:
-    """Curva de fiabilidad para P(victoria local): predicho vs observado."""
-    df = preds.copy()
-    df["bin"] = pd.cut(df["p_home"], np.linspace(0, 1, bins + 1), include_lowest=True)
-    grp = df.groupby("bin", observed=True)
-    out = pd.DataFrame({
-        "prob_predicha": grp["p_home"].mean(),
-        "frec_observada": grp["actual_outcome"].apply(lambda s: (s == "H").mean()),
-        "n": grp.size(),
-    }).dropna().reset_index(drop=True)
-    return out
-
-
-# --------------------------------------------------------------- carga de datos
 @st.cache_data(show_spinner=False)
 def load_table(name: str) -> pd.DataFrame:
     return storage.query(f'SELECT * FROM "{name}"')
 
 
+def has_table(name: str) -> bool:
+    return name in storage.list_tables()
+
+
 @st.cache_resource(show_spinner=True)
-def get_model(league_table: str) -> dc.DixonColesModel:
-    matches = storage.query(f'SELECT * FROM "{league_table}"')
-    return dc.fit(matches, xi=0.0)
+def model_for(code: str) -> dc.DixonColesModel | None:
+    """Ajusta (cacheado) el Dixon-Coles de una competición con sus FINISHED."""
+    fx = load_table("fixtures")
+    fin = fx[(fx["code"] == code) & (fx["status"] == "FINISHED")].dropna(
+        subset=["home_score", "away_score"]).copy()
+    if len(fin) < 40:
+        return None
+    fin["home_score"] = fin["home_score"].astype(int)
+    fin["away_score"] = fin["away_score"].astype(int)
+    return dc.fit(fin, xi=0.003)
 
 
-def available_tables() -> list[str]:
-    return storage.list_tables()
+def calendar_rows(fixtures: pd.DataFrame, preds: pd.DataFrame,
+                  day: str, comps: list[str]) -> pd.DataFrame:
+    sel = fixtures[(fixtures["match_date"] == day) & (fixtures["competition"].isin(comps))]
+    out = []
+    for _, m in sel.iterrows():
+        row = {"Competición": m["competition"], "Local": m["home_team"],
+               "Visitante": m["away_team"], "1": "—", "X": "—", "2": "—",
+               "Over 2.5": "—", "Resultado": "—"}
+        if m["status"] == "FINISHED" and pd.notna(m["home_score"]):
+            row["Resultado"] = f"{int(m['home_score'])}–{int(m['away_score'])}"
+        elif not preds.empty:
+            p = preds[(preds["code"] == m["code"]) & (preds["home_team"] == m["home_team"])
+                      & (preds["away_team"] == m["away_team"]) & (preds["match_date"] == day)]
+            if len(p):
+                p = p.iloc[0]
+                row["1"] = f"{p['p_home']:.0%}"
+                row["X"] = f"{p['p_draw']:.0%}"
+                row["2"] = f"{p['p_away']:.0%}"
+                row["Over 2.5"] = f"{p['p_over_2.5']:.0%}"
+        out.append(row)
+    return pd.DataFrame(out)
 
 
-# ------------------------------------------------------------------------ barra
+# ------------------------------------------------------------------ barra
 st.sidebar.title("⚽ futbol-predict")
-tables = available_tables()
-
-if st.sidebar.button("Actualizar datos", width='stretch', type="primary"):
-    with st.spinner("Descargando datos y reentrenando el modelo..."):
+if st.sidebar.button("Actualizar datos (local)", width="stretch"):
+    with st.spinner("Descargando resultados y reentrenando..."):
         res = subprocess.run([sys.executable, str(ROOT / "run.py")],
                              capture_output=True, text=True)
-    if res.returncode == 0:
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.sidebar.success("Datos actualizados")
-        st.rerun()
-    else:
-        st.sidebar.error("Falló la actualización. Revisa la conexión.")
-        st.sidebar.code(res.stderr[-800:] or res.stdout[-800:])
+    st.cache_data.clear(); st.cache_resource.clear()
+    (st.sidebar.success if res.returncode == 0 else st.sidebar.error)(
+        "Listo" if res.returncode == 0 else "Falló (¿clave/conexión?)")
+    st.rerun()
+st.sidebar.caption("En la nube, los datos se refrescan solos cada día.")
 
-st.sidebar.caption("Tablas disponibles:")
-st.sidebar.write(", ".join(tables) if tables else "ninguna todavía")
-
-if not tables:
-    st.title("No hay datos todavía")
-    st.info("Pulsa **Actualizar datos** en la barra lateral para descargar los "
-            "datos y entrenar el modelo por primera vez.")
-    st.stop()
-
-league_table = pick_league_table(tables)
-
-# ------------------------------------------------------------------------ vistas
 st.title("Análisis predictivo de fútbol")
-tab_cal, tab_pred, tab_hist, tab_rat = st.tabs(
-    ["Calendario", "Predicción de partido", "Histórico vs predicción", "Ratings"])
+tabs = st.tabs(["Calendario", "Predicción de partido", "Validación del modelo", "Ratings"])
 
-# --- Calendario ---------------------------------------------------------------
-with tab_cal:
-    st.subheader("Calendario de partidos")
-    if "fd_matches_WC" in tables:
-        cal = load_table("fd_matches_WC")
-        cols = [c for c in ["utcDate", "stage", "group", "status",
-                            "homeTeam.name", "awayTeam.name",
-                            "score.fullTime.home", "score.fullTime.away"]
-                if c in cal.columns]
-        view = cal[cols].copy() if cols else cal
-        stages = sorted(s for s in view.get("stage", pd.Series()).dropna().unique())
-        if stages:
-            chosen = st.multiselect("Fase", stages, default=stages)
-            view = view[view["stage"].isin(chosen)]
-        st.dataframe(view, width='stretch', hide_index=True)
+# --- Calendario ---------------------------------------------------------
+with tabs[0]:
+    if not has_table("fixtures"):
+        st.info("Aún no hay partidos cargados. En la nube se llenará con el primer "
+                "refresco automático; en local, pulsa **Actualizar datos** "
+                "(necesita la clave de football-data.org).")
     else:
-        st.warning("Aún no hay calendario del Mundial desde football-data.org "
-                   "(requiere conexión al actualizar). Mostrando el Mundial 2022 "
-                   "de StatsBomb como referencia.")
-        wc = [t for t in tables if t.startswith("sb_matches_43_")]
-        if wc:
-            m = load_table(wc[0])
-            cols = [c for c in ["match_date", "home_team", "away_team",
-                                "home_score", "away_score", "competition_stage"]
-                    if c in m.columns]
-            st.dataframe(m[cols].sort_values("match_date"),
-                         width='stretch', hide_index=True)
-
-# --- Predicción de partido ----------------------------------------------------
-with tab_pred:
-    st.subheader("Probabilidades por partido")
-    if not league_table:
-        st.info("No hay liga cargada para el modelo.")
-    else:
-        model = get_model(league_table)
-        st.caption(f"Modelo Dixon-Coles ajustado sobre {model.n_matches} partidos. "
-                   f"Ventaja local exp(γ)={np.exp(model.home_adv):.2f}.")
-        c1, c2 = st.columns(2)
-        home = c1.selectbox("Local", model.teams, index=0)
-        away = c2.selectbox("Visitante", model.teams, index=1)
-        if home == away:
-            st.info("Elige dos equipos distintos.")
+        fixtures = load_table("fixtures")
+        preds = load_table("predicciones_upcoming") if has_table("predicciones_upcoming") else pd.DataFrame()
+        comps_all = sorted(fixtures["competition"].unique())
+        c1, c2 = st.columns([1, 2])
+        day = c1.date_input("Día", value=dt.date.today()).isoformat()
+        comps = c2.multiselect("Competiciones", comps_all, default=comps_all)
+        rows = calendar_rows(fixtures, preds, day, comps)
+        if rows.empty:
+            st.caption("No hay partidos ese día en las competiciones elegidas.")
         else:
-            p = model.predict(home, away)
-            m1, mX, m2 = st.columns(3)
-            m1.metric(f"Gana {home}", f"{p['p_home']:.0%}")
-            mX.metric("Empate", f"{p['p_draw']:.0%}")
-            m2.metric(f"Gana {away}", f"{p['p_away']:.0%}")
-            o1, o2, o3 = st.columns(3)
-            o1.metric("Over 2.5 goles", f"{p['p_over_2.5']:.0%}")
-            o2.metric("Ambos marcan (BTTS)", f"{p['p_btts']:.0%}")
-            o3.metric("xG estimado", f"{p['xg_home']:.2f} – {p['xg_away']:.2f}")
+            st.dataframe(rows, width="stretch", hide_index=True)
+            st.caption("1 / X / 2 = probabilidad de victoria local, empate y "
+                       "visitante según el modelo. Resultado = partido ya jugado.")
 
-            # Elemento característico: matriz de marcadores del Poisson bivariado
-            st.markdown("**Distribución de marcadores** (probabilidad de cada resultado)")
-            mat = model.score_matrix(home, away, max_goals=5)
-            grid = pd.DataFrame(
-                [(int(i), int(j), float(mat[i, j]))
-                 for i in range(mat.shape[0]) for j in range(6)],
-                columns=["local", "visitante", "prob"])
-            heat = (alt.Chart(grid).mark_rect().encode(
+# --- Predicción de partido ----------------------------------------------
+with tabs[1]:
+    if not has_table("coverage"):
+        st.info("Sin modelos todavía. Actualiza los datos primero.")
+    else:
+        cov = load_table("coverage")
+        active = cov[cov["n_finished"] >= 40]
+        if active.empty:
+            st.info("Ninguna competición tiene aún suficientes partidos para un modelo fiable.")
+        else:
+            comp = st.selectbox("Competición", active["competition"].tolist())
+            code = active[active["competition"] == comp]["code"].iloc[0]
+            model = model_for(code)
+            if model is None:
+                st.info("Modelo no disponible para esa competición.")
+            else:
+                col1, col2 = st.columns(2)
+                home = col1.selectbox("Local", model.teams, index=0)
+                away = col2.selectbox("Visitante", model.teams, index=1)
+                if home != away:
+                    p = model.predict(home, away)
+                    a, b, c = st.columns(3)
+                    a.metric(f"Gana {home}", f"{p['p_home']:.0%}")
+                    b.metric("Empate", f"{p['p_draw']:.0%}")
+                    c.metric(f"Gana {away}", f"{p['p_away']:.0%}")
+                    d, e, f = st.columns(3)
+                    d.metric("Over 2.5", f"{p['p_over_2.5']:.0%}")
+                    e.metric("Ambos marcan", f"{p['p_btts']:.0%}")
+                    f.metric("xG estimado", f"{p['xg_home']:.2f} – {p['xg_away']:.2f}")
+                    st.markdown("**Distribución de marcadores**")
+                    mat = model.score_matrix(home, away, max_goals=5)
+                    grid = pd.DataFrame([(i, j, float(mat[i, j])) for i in range(6)
+                                         for j in range(6)], columns=["local", "visitante", "prob"])
+                    st.altair_chart(alt.Chart(grid).mark_rect().encode(
                         x=alt.X("visitante:O", title=f"Goles {away}"),
                         y=alt.Y("local:O", title=f"Goles {home}", sort="descending"),
-                        color=alt.Color("prob:Q", scale=alt.Scale(scheme="greens"),
-                                        legend=None),
-                        tooltip=[alt.Tooltip("prob:Q", format=".1%")])
-                    .properties(height=260))
-            st.altair_chart(heat, width='stretch')
+                        color=alt.Color("prob:Q", scale=alt.Scale(scheme="greens"), legend=None),
+                        tooltip=[alt.Tooltip("prob:Q", format=".1%")]).properties(height=260),
+                        width="stretch")
 
-# --- Histórico vs predicción --------------------------------------------------
-with tab_hist:
-    st.subheader("Histórico vs predicción (backtest sin fuga de información)")
-    if "predicciones" not in tables:
-        st.info("Aún no hay predicciones. Pulsa Actualizar datos.")
+# --- Validación del modelo ----------------------------------------------
+with tabs[2]:
+    st.subheader("¿Funciona el modelo? Backtest sin fuga de información")
+    if not has_table("predicciones"):
+        st.info("Sin validación todavía.")
     else:
         preds = load_table("predicciones")
-        met = compute_metrics(preds)
-        cols = st.columns(len(met))
-        for col, (k, v) in zip(cols, met.items()):
-            col.metric(k, v)
+        classes = ["H", "D", "A"]; cidx = {c: i for i, c in enumerate(classes)}
+        probs = preds[["p_home", "p_draw", "p_away"]].to_numpy()
+        y = preds["actual_outcome"].map(cidx).to_numpy()
+        pick = np.clip(probs[np.arange(len(y)), y], 1e-12, 1)
+        a, b, c = st.columns(3)
+        a.metric("Partidos evaluados", len(preds))
+        b.metric("Log loss (1X2)", f"{-np.mean(np.log(pick)):.3f}")
+        c.metric("Acierto (1X2)", f"{(probs.argmax(1) == y).mean():.1%}")
+        st.caption("Validado sobre la Premier 2015/16. Demuestra que el motor que "
+                   "alimenta el calendario está calibrado y bate a un baseline ingenuo.")
+        st.dataframe(preds[["match_date", "home_team", "away_team", "p_home",
+                            "p_draw", "p_away", "actual_outcome"]],
+                     width="stretch", hide_index=True)
 
-        st.markdown("**Curva de fiabilidad** — si el modelo está bien calibrado, "
-                    "los puntos caen sobre la diagonal.")
-        rel = reliability_table(preds)
-        diag = pd.DataFrame({"x": [0, 1], "y": [0, 1]})
-        base = alt.Chart(rel).mark_circle(size=90, color=ACCENT).encode(
-            x=alt.X("prob_predicha:Q", title="Probabilidad predicha (victoria local)",
-                    scale=alt.Scale(domain=[0, 1])),
-            y=alt.Y("frec_observada:Q", title="Frecuencia observada",
-                    scale=alt.Scale(domain=[0, 1])),
-            tooltip=[alt.Tooltip("prob_predicha:Q", format=".2f"),
-                     alt.Tooltip("frec_observada:Q", format=".2f"),
-                     alt.Tooltip("n:Q", title="partidos")])
-        line = alt.Chart(diag).mark_line(strokeDash=[4, 4], color="gray").encode(x="x", y="y")
-        st.altair_chart((line + base).properties(height=320), width='stretch')
-
-        st.markdown("**Detalle por partido**")
-        show = preds[["match_date", "home_team", "away_team", "p_home", "p_draw",
-                      "p_away", "actual_home", "actual_away", "actual_outcome"]]
-        st.dataframe(show, width='stretch', hide_index=True)
-
-# --- Ratings ------------------------------------------------------------------
-with tab_rat:
-    st.subheader("Fuerza de los equipos")
-    if "ratings" not in tables:
-        st.info("Aún no hay ratings. Pulsa Actualizar datos.")
+# --- Ratings ------------------------------------------------------------
+with tabs[3]:
+    if not has_table("ratings_by_comp"):
+        st.info("Sin ratings todavía.")
     else:
-        ratings = load_table("ratings")
+        ratings = load_table("ratings_by_comp")
+        comp = st.selectbox("Competición ", sorted(ratings["competition"].unique()))
+        r = ratings[ratings["competition"] == comp]
         st.caption("Ataque alto = marca más. Defensa baja = encaja menos.")
-        chart = (alt.Chart(ratings).mark_bar(color=ACCENT).encode(
-                    x=alt.X("attack:Q", title="Fuerza de ataque"),
-                    y=alt.Y("team:N", sort="-x", title=None),
-                    tooltip=["team", "attack", "defense"])
-                 .properties(height=26 * len(ratings)))
-        st.altair_chart(chart, width='stretch')
-        st.dataframe(ratings, width='stretch', hide_index=True)
+        st.altair_chart(alt.Chart(r).mark_bar(color=ACCENT).encode(
+            x=alt.X("attack:Q", title="Fuerza de ataque"),
+            y=alt.Y("team:N", sort="-x", title=None),
+            tooltip=["team", "attack", "defense"]).properties(height=26 * len(r)),
+            width="stretch")
